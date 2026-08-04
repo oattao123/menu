@@ -7,7 +7,7 @@ import { StaffPinModal } from './StaffPinModal';
 export const STAFF_TABS = ['pos', 'orders', 'inventory'];
 
 export const Sidebar = ({ activeTab, setActiveTab, isOpen, onClose }) => {
-  const { settings, isStaff, enterStaffMode, cloudStatus } = useStore();
+  const { settings, isStaff, enterStaffMode, cloudStatus, pendingCount } = useStore();
   const [isPinOpen, setIsPinOpen] = useState(false);
 
   const navItems = [
@@ -103,10 +103,12 @@ export const Sidebar = ({ activeTab, setActiveTab, isOpen, onClose }) => {
           {cloudStatus === 'connecting' && <RefreshCw size={14} />}
           {cloudStatus === 'error' && <AlertTriangle size={14} />}
           <span>
-            {cloudStatus === 'synced' && 'ข้อมูลซิงก์กับฐานข้อมูลแล้ว'}
+            {cloudStatus === 'synced' &&
+              (pendingCount > 0 ? `กำลังบันทึกขึ้นฐานข้อมูล (${pendingCount})` : 'ข้อมูลซิงก์กับฐานข้อมูลแล้ว')}
             {cloudStatus === 'offline' && 'เก็บข้อมูลในเครื่องนี้ (Offline)'}
             {cloudStatus === 'connecting' && 'กำลังเชื่อมฐานข้อมูล...'}
-            {cloudStatus === 'error' && 'เชื่อมฐานข้อมูลไม่ได้'}
+            {cloudStatus === 'error' &&
+              (pendingCount > 0 ? `ออฟไลน์ — มี ${pendingCount} รายการรอส่ง` : 'เชื่อมฐานข้อมูลไม่ได้')}
           </span>
         </div>
       </div>

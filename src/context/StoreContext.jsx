@@ -97,40 +97,89 @@ export const StoreProvider = ({ children }) => {
     setter(value);
   };
 
-  // Initial load + realtime subscription
+  // Changes waiting to reach the database (offline, server error, ...).
+  // They stay queued — and mirrored in localStorage — until the write succeeds.
+  const pendingRef = useRef({});
+  const flushingRef = useRef(false);
+  const [pendingCount, setPendingCount] = useState(0);
+
+  const flushPending = async () => {
+    if (!isCloudEnabled || !hydratedRef.current || flushingRef.current) return;
+    const keys = Object.keys(pendingRef.current);
+    if (keys.length === 0) return;
+
+    flushingRef.current = true;
+    try {
+      for (const key of keys) {
+        const value = pendingRef.current[key];
+        try {
+          await pushState(key, value);
+          // Only clear if nothing newer arrived while this write was in flight
+          if (pendingRef.current[key] === value) {
+            delete pendingRef.current[key];
+            lastSyncedRef.current[key] = JSON.stringify(value);
+          }
+        } catch (err) {
+          setCloudStatus('error');
+          setCloudError(err?.message || 'บันทึกขึ้นฐานข้อมูลไม่สำเร็จ (จะลองส่งใหม่อัตโนมัติ)');
+          return; // keep the rest queued, the retry timer will come back
+        }
+      }
+      setCloudStatus('synced');
+      setCloudError('');
+    } finally {
+      flushingRef.current = false;
+      setPendingCount(Object.keys(pendingRef.current).length);
+    }
+  };
+
+  // Latest local state, readable from the connect loop without re-running it
+  const localSnapshotRef = useRef(null);
+  localSnapshotRef.current = {
+    products,
+    orders,
+    settings,
+    employees,
+    cash_transactions: cashTransactions,
+    categories,
+    sizes,
+  };
+
+  // Work done on this device before the database could be reached must not be
+  // thrown away when the connection finally succeeds.
+  const editedWhileDisconnectedRef = useRef(false);
+
+  // Initial load (with retry) + realtime subscription
   useEffect(() => {
     if (!isCloudEnabled) return;
     let channel;
     let cancelled = false;
+    let retryTimer;
 
-    const localSnapshot = {
-      products,
-      orders,
-      settings,
-      employees,
-      cash_transactions: cashTransactions,
-      categories,
-      sizes,
-    };
-
-    (async () => {
+    const connect = async () => {
+      if (cancelled || hydratedRef.current) return;
       try {
         const remote = await fetchAllState();
         if (cancelled) return;
 
+        const local = localSnapshotRef.current;
         for (const key of Object.keys(setterFor)) {
-          if (remote[key] !== undefined) {
+          const hasRemote = remote[key] !== undefined;
+
+          if (hasRemote && !editedWhileDisconnectedRef.current) {
             applyRemote(key, remote[key]);
           } else {
-            // First run: seed the database from whatever this device already has
-            await pushState(key, localSnapshot[key]);
-            lastSyncedRef.current[key] = JSON.stringify(localSnapshot[key]);
+            // Either the database is empty (first run) or this device worked
+            // offline — send what we have up so nothing is lost.
+            pendingRef.current[key] = local[key];
           }
         }
 
         hydratedRef.current = true;
+        setPendingCount(Object.keys(pendingRef.current).length);
         setCloudStatus('synced');
         setCloudError('');
+        flushPending();
 
         channel = supabase
           .channel('store_state_changes')
@@ -147,43 +196,71 @@ export const StoreProvider = ({ children }) => {
       } catch (err) {
         if (cancelled) return;
         setCloudStatus('error');
-        setCloudError(err?.message || 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ');
+        setCloudError(err?.message || 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ (จะลองใหม่อัตโนมัติ)');
+        retryTimer = setTimeout(connect, 5000);
       }
-    })();
+    };
+
+    connect();
+    window.addEventListener('online', connect);
 
     return () => {
       cancelled = true;
+      clearTimeout(retryTimer);
+      window.removeEventListener('online', connect);
       if (channel) supabase.removeChannel(channel);
     };
-    // Runs once — the local snapshot is only used to seed an empty database
+    // Runs once; retries and reconnects are handled inside
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Push local changes up (debounced, and never echoing what we just received)
   const useCloudPush = (key, value) => {
     useEffect(() => {
-      if (!isCloudEnabled || !hydratedRef.current) return;
+      if (!isCloudEnabled) return;
       const json = JSON.stringify(value);
+      if (!hydratedRef.current) {
+        // Changed before the first successful load — local wins when we connect
+        if (lastSyncedRef.current[key] !== json) editedWhileDisconnectedRef.current = true;
+        return;
+      }
       if (lastSyncedRef.current[key] === json) return;
 
       const timer = setTimeout(() => {
-        lastSyncedRef.current[key] = json;
-        pushState(key, value)
-          .then(() => {
-            setCloudStatus('synced');
-            setCloudError('');
-          })
-          .catch((err) => {
-            // Allow a retry on the next change
-            delete lastSyncedRef.current[key];
-            setCloudStatus('error');
-            setCloudError(err?.message || 'บันทึกขึ้นฐานข้อมูลไม่สำเร็จ');
-          });
+        pendingRef.current[key] = value;
+        setPendingCount(Object.keys(pendingRef.current).length);
+        flushPending();
       }, 400);
 
       return () => clearTimeout(timer);
     }, [key, value]);
   };
+
+  // Retry queued writes: on a timer, and immediately when the network returns
+  useEffect(() => {
+    if (!isCloudEnabled) return;
+    const timer = setInterval(() => {
+      if (Object.keys(pendingRef.current).length > 0) flushPending();
+    }, 5000);
+    const onOnline = () => flushPending();
+    window.addEventListener('online', onOnline);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('online', onOnline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Warn before closing the tab while changes have not reached the database
+  useEffect(() => {
+    if (!isCloudEnabled || pendingCount === 0) return;
+    const warn = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [pendingCount]);
 
   useCloudPush('products', products);
   useCloudPush('orders', orders);
@@ -673,6 +750,7 @@ export const StoreProvider = ({ children }) => {
         sizes,
         cloudStatus,
         cloudError,
+        pendingCount,
         isCloudEnabled,
         role,
         isStaff,
