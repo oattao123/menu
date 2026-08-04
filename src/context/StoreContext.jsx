@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { supabase, isCloudEnabled } from '../lib/supabase';
-import { COLLECTIONS, loadEverything, runOp } from '../lib/db';
+import { TABLE, SINGLE_KEYS, rowKey, loadEverything, runOp } from '../lib/db';
 import {
   INITIAL_PRODUCTS,
   INITIAL_ORDERS,
@@ -114,33 +114,19 @@ export const StoreProvider = ({ children }) => {
 
   const queueOp = (op) => {
     if (!isCloudEnabled) return;
-    const key =
-      op.type === 'settings'
-        ? 'settings'
-        : op.type === 'replaceAll'
-          ? `${op.table}:*`
-          : `${op.table}:${op.id}`;
-    queueRef.current.set(key, op);
+    queueRef.current.set(`${op.type}:${op.key}`, op);
     persistQueue();
     flushQueue();
   };
 
-  // Write helpers used by the actions below
-  const saveRow = (name, obj) => {
-    const c = COLLECTIONS[name];
-    queueOp({ type: 'upsert', table: c.table, idField: c.idField, id: obj[c.idField], row: c.toRow(obj) });
-  };
-  const saveRows = (name, list) => list.forEach((obj) => saveRow(name, obj));
-  const deleteRow = (name, id) => {
-    const c = COLLECTIONS[name];
-    queueOp({ type: 'delete', table: c.table, idField: c.idField, id });
-  };
-  // categories / sizes are short ordered lists — replace them wholesale
-  const saveList = (name, list) => {
-    const c = COLLECTIONS[name];
-    queueOp({ type: 'replaceAll', table: c.table, idField: c.idField, rows: list.map((v, i) => c.toRow(v, i)) });
-  };
-  const saveSettings = (data) => queueOp({ type: 'settings', data });
+  // Write helpers used by the actions below — each writes a single record
+  const saveRow = (collection, obj) =>
+    queueOp({ type: 'upsert', key: rowKey(collection, obj.id), data: obj });
+  const saveRows = (collection, list) => list.forEach((obj) => saveRow(collection, obj));
+  const deleteRow = (collection, id) => queueOp({ type: 'delete', key: rowKey(collection, id) });
+  // Short ordered lists stay as one row each
+  const saveList = (name, list) => queueOp({ type: 'upsert', key: SINGLE_KEYS[name], data: list });
+  const saveSettings = (data) => queueOp({ type: 'upsert', key: 'settings', data });
 
   // Apply a row that arrived from another device
   const mergeRemoteRow = (setter, row, idField = 'id') => {
@@ -175,8 +161,8 @@ export const StoreProvider = ({ children }) => {
           remote.orders.length === 0 &&
           remote.employees.length === 0 &&
           remote.cashTransactions.length === 0 &&
-          remote.categories.length === 0 &&
-          remote.sizes.length === 0;
+          !remote.categories &&
+          !remote.sizes;
 
         if (databaseIsEmpty) {
           // Brand new database: seed it from whatever this device has
@@ -192,8 +178,8 @@ export const StoreProvider = ({ children }) => {
           setOrders(remote.orders);
           setCashTransactions(remote.cashTransactions);
           setEmployees(remote.employees);
-          if (remote.categories.length) setCategories(remote.categories);
-          if (remote.sizes.length) setSizes(remote.sizes);
+          if (remote.categories) setCategories(remote.categories);
+          if (remote.sizes) setSizes(remote.sizes);
           if (remote.settings) setSettings(remote.settings);
         }
 
@@ -204,29 +190,31 @@ export const StoreProvider = ({ children }) => {
         // Anything queued while offline is written on top of the loaded data
         flushQueue();
 
-        channel = supabase.channel('shop_changes');
-        const tableSetters = {
-          products: [setProducts, COLLECTIONS.products.fromRow],
-          orders: [setOrders, COLLECTIONS.orders.fromRow],
-          cash_transactions: [setCashTransactions, COLLECTIONS.cashTransactions.fromRow],
-          employees: [setEmployees, COLLECTIONS.employees.fromRow],
+        const setterFor = {
+          product: setProducts,
+          order: setOrders,
+          cash: setCashTransactions,
+          employee: setEmployees,
         };
-        for (const [table, [setter, fromRow]] of Object.entries(tableSetters)) {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table }, (payload) => {
-            if (payload.eventType === 'DELETE') removeRemoteRow(setter, payload.old?.id);
-            else mergeRemoteRow(setter, fromRow(payload.new));
-          });
-        }
-        channel.on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, (payload) => {
-          if (payload.new?.data) setSettings(payload.new.data);
-        });
-        for (const [table, setter] of [['categories', setCategories], ['sizes', setSizes]]) {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table }, async () => {
-            const { data } = await supabase.from(table).select('*').order('sort_order');
-            if (data) setter(data.map((r) => r.name));
-          });
-        }
-        channel.subscribe();
+
+        channel = supabase
+          .channel('shop_changes')
+          .on('postgres_changes', { event: '*', schema: 'public', table: TABLE }, (payload) => {
+            const key = payload.new?.key ?? payload.old?.key;
+            if (!key) return;
+
+            if (key === 'categories') return setCategories(payload.new?.data || []);
+            if (key === 'sizes') return setSizes(payload.new?.data || []);
+            if (key === 'settings') return payload.new?.data && setSettings(payload.new.data);
+
+            const [prefix, id] = key.split(':');
+            const setter = setterFor[prefix];
+            if (!setter || !id) return;
+
+            if (payload.eventType === 'DELETE') removeRemoteRow(setter, id);
+            else if (payload.new?.data) mergeRemoteRow(setter, payload.new.data);
+          })
+          .subscribe();
       } catch (err) {
         if (cancelled) return;
         // An unreachable database must not block the counter — fall back to the
