@@ -1,12 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
-import {
-  supabase,
-  isCloudEnabled,
-  fetchAllState,
-  pushState,
-  STATE_TABLE,
-  CLIENT_ID,
-} from '../lib/supabase';
+import { supabase, isCloudEnabled } from '../lib/supabase';
+import { COLLECTIONS, loadEverything, runOp } from '../lib/db';
 import {
   INITIAL_PRODUCTS,
   INITIAL_ORDERS,
@@ -68,94 +62,101 @@ export const StoreProvider = ({ children }) => {
   const isStaff = role === 'staff';
 
   // ==========================================
-  // Cloud sync (Supabase) — shared data across devices.
+  // Cloud sync (Supabase) — one row per record, written individually.
   // Without credentials everything below is skipped and the app stays local-only.
   // ==========================================
 
-  // 'offline' = no database configured, 'connecting' | 'synced' | 'error'
   const [cloudStatus, setCloudStatus] = useState(isCloudEnabled ? 'connecting' : 'offline');
-  // True until the first successful load — the app shows a loader instead of
-  // local cache, so nobody sells against stale numbers after a deploy.
+  // True until the first successful load, so the UI never shows this browser's
+  // cache as if it were current shop data.
   const [isHydrating, setIsHydrating] = useState(isCloudEnabled);
   const [cloudError, setCloudError] = useState('');
-
-  const hydratedRef = useRef(false);
-  // Last value seen from / sent to the database per key, so echoes are not pushed back
-  const lastSyncedRef = useRef({});
-
-  const setterFor = {
-    products: setProducts,
-    orders: setOrders,
-    settings: setSettings,
-    employees: setEmployees,
-    cash_transactions: setCashTransactions,
-    categories: setCategories,
-    sizes: setSizes,
-  };
-
-  const applyRemote = (key, value) => {
-    const setter = setterFor[key];
-    if (!setter || value === undefined || value === null) return;
-    lastSyncedRef.current[key] = JSON.stringify(value);
-    setter(value);
-  };
-
-  // Changes waiting to reach the database (offline, server error, ...).
-  // They stay queued — and mirrored in localStorage — until the write succeeds.
-  const pendingRef = useRef({});
-  const flushingRef = useRef(false);
   const [pendingCount, setPendingCount] = useState(0);
 
-  const flushPending = async () => {
+  const hydratedRef = useRef(false);
+  const flushingRef = useRef(false);
+
+  // Writes waiting to reach the database, keyed by row so repeated edits to the
+  // same record collapse into a single write. Persisted so a reload keeps them.
+  const queueRef = useRef(
+    new Map(JSON.parse(localStorage.getItem('chic_store_op_queue') || '[]'))
+  );
+
+  const persistQueue = () => {
+    localStorage.setItem('chic_store_op_queue', JSON.stringify([...queueRef.current]));
+    setPendingCount(queueRef.current.size);
+  };
+
+  const flushQueue = async () => {
     if (!isCloudEnabled || !hydratedRef.current || flushingRef.current) return;
-    const keys = Object.keys(pendingRef.current);
-    if (keys.length === 0) return;
+    if (queueRef.current.size === 0) return;
 
     flushingRef.current = true;
     try {
-      for (const key of keys) {
-        const value = pendingRef.current[key];
+      for (const [key, op] of [...queueRef.current]) {
         try {
-          await pushState(key, value);
-          // Only clear if nothing newer arrived while this write was in flight
-          if (pendingRef.current[key] === value) {
-            delete pendingRef.current[key];
-            lastSyncedRef.current[key] = JSON.stringify(value);
-          }
+          await runOp(op);
+          // Only drop it if no newer write for the same row arrived meanwhile
+          if (queueRef.current.get(key) === op) queueRef.current.delete(key);
         } catch (err) {
           setCloudStatus('error');
           setCloudError(err?.message || 'บันทึกขึ้นฐานข้อมูลไม่สำเร็จ (จะลองส่งใหม่อัตโนมัติ)');
-          return; // keep the rest queued, the retry timer will come back
+          return; // leave the rest queued for the retry timer
         }
       }
       setCloudStatus('synced');
       setCloudError('');
     } finally {
       flushingRef.current = false;
-      setPendingCount(Object.keys(pendingRef.current).length);
+      persistQueue();
     }
   };
 
-  // Latest local state, readable from the connect loop without re-running it
-  const localSnapshotRef = useRef(null);
-  localSnapshotRef.current = {
-    products,
-    orders,
-    settings,
-    employees,
-    cash_transactions: cashTransactions,
-    categories,
-    sizes,
+  const queueOp = (op) => {
+    if (!isCloudEnabled) return;
+    const key =
+      op.type === 'settings'
+        ? 'settings'
+        : op.type === 'replaceAll'
+          ? `${op.table}:*`
+          : `${op.table}:${op.id}`;
+    queueRef.current.set(key, op);
+    persistQueue();
+    flushQueue();
   };
 
-  // Work done on this device while the database was unreachable must not be
-  // thrown away when the connection finally succeeds. Only set once a load has
-  // actually failed — otherwise the database always wins on startup, so a fresh
-  // device (or a new deploy) can never push sample data over real data.
-  const editedWhileDisconnectedRef = useRef(false);
-  const connectFailedRef = useRef(false);
+  // Write helpers used by the actions below
+  const saveRow = (name, obj) => {
+    const c = COLLECTIONS[name];
+    queueOp({ type: 'upsert', table: c.table, idField: c.idField, id: obj[c.idField], row: c.toRow(obj) });
+  };
+  const saveRows = (name, list) => list.forEach((obj) => saveRow(name, obj));
+  const deleteRow = (name, id) => {
+    const c = COLLECTIONS[name];
+    queueOp({ type: 'delete', table: c.table, idField: c.idField, id });
+  };
+  // categories / sizes are short ordered lists — replace them wholesale
+  const saveList = (name, list) => {
+    const c = COLLECTIONS[name];
+    queueOp({ type: 'replaceAll', table: c.table, idField: c.idField, rows: list.map((v, i) => c.toRow(v, i)) });
+  };
+  const saveSettings = (data) => queueOp({ type: 'settings', data });
 
-  // Initial load (with retry) + realtime subscription
+  // Apply a row that arrived from another device
+  const mergeRemoteRow = (setter, row, idField = 'id') => {
+    setter((prev) => {
+      const idx = prev.findIndex((x) => x[idField] === row[idField]);
+      if (idx === -1) return [row, ...prev];
+      const next = [...prev];
+      next[idx] = row;
+      return next;
+    });
+  };
+
+  const removeRemoteRow = (setter, id, idField = 'id') =>
+    setter((prev) => prev.filter((x) => x[idField] !== id));
+
+  // Initial load (with retry) + realtime subscriptions
   useEffect(() => {
     if (!isCloudEnabled) return;
     let channel;
@@ -165,46 +166,71 @@ export const StoreProvider = ({ children }) => {
     const connect = async () => {
       if (cancelled || hydratedRef.current) return;
       try {
-        const remote = await fetchAllState();
+        const remote = await loadEverything();
         if (cancelled) return;
 
-        const local = localSnapshotRef.current;
-        for (const key of Object.keys(setterFor)) {
-          const hasRemote = remote[key] !== undefined;
+        const databaseIsEmpty =
+          !remote.settings &&
+          remote.products.length === 0 &&
+          remote.orders.length === 0 &&
+          remote.employees.length === 0 &&
+          remote.cashTransactions.length === 0 &&
+          remote.categories.length === 0 &&
+          remote.sizes.length === 0;
 
-          if (hasRemote && !editedWhileDisconnectedRef.current) {
-            applyRemote(key, remote[key]);
-          } else {
-            // Either the database is empty (first run) or this device worked
-            // offline — send what we have up so nothing is lost.
-            pendingRef.current[key] = local[key];
-          }
+        if (databaseIsEmpty) {
+          // Brand new database: seed it from whatever this device has
+          saveRows('products', products);
+          saveRows('orders', orders);
+          saveRows('cashTransactions', cashTransactions);
+          saveRows('employees', employees);
+          saveList('categories', categories);
+          saveList('sizes', sizes);
+          saveSettings(settings);
+        } else {
+          setProducts(remote.products);
+          setOrders(remote.orders);
+          setCashTransactions(remote.cashTransactions);
+          setEmployees(remote.employees);
+          if (remote.categories.length) setCategories(remote.categories);
+          if (remote.sizes.length) setSizes(remote.sizes);
+          if (remote.settings) setSettings(remote.settings);
         }
 
         hydratedRef.current = true;
         setIsHydrating(false);
-        setPendingCount(Object.keys(pendingRef.current).length);
         setCloudStatus('synced');
         setCloudError('');
-        flushPending();
+        // Anything queued while offline is written on top of the loaded data
+        flushQueue();
 
-        channel = supabase
-          .channel('store_state_changes')
-          .on(
-            'postgres_changes',
-            { event: '*', schema: 'public', table: STATE_TABLE },
-            (payload) => {
-              const row = payload.new;
-              if (!row || row.client_id === CLIENT_ID) return;
-              applyRemote(row.key, row.data);
-            }
-          )
-          .subscribe();
+        channel = supabase.channel('shop_changes');
+        const tableSetters = {
+          products: [setProducts, COLLECTIONS.products.fromRow],
+          orders: [setOrders, COLLECTIONS.orders.fromRow],
+          cash_transactions: [setCashTransactions, COLLECTIONS.cashTransactions.fromRow],
+          employees: [setEmployees, COLLECTIONS.employees.fromRow],
+        };
+        for (const [table, [setter, fromRow]] of Object.entries(tableSetters)) {
+          channel.on('postgres_changes', { event: '*', schema: 'public', table }, (payload) => {
+            if (payload.eventType === 'DELETE') removeRemoteRow(setter, payload.old?.id);
+            else mergeRemoteRow(setter, fromRow(payload.new));
+          });
+        }
+        channel.on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, (payload) => {
+          if (payload.new?.data) setSettings(payload.new.data);
+        });
+        for (const [table, setter] of [['categories', setCategories], ['sizes', setSizes]]) {
+          channel.on('postgres_changes', { event: '*', schema: 'public', table }, async () => {
+            const { data } = await supabase.from(table).select('*').order('sort_order');
+            if (data) setter(data.map((r) => r.name));
+          });
+        }
+        channel.subscribe();
       } catch (err) {
         if (cancelled) return;
-        connectFailedRef.current = true;
-        // Unreachable database must not block the counter — fall back to the
-        // local cache and keep retrying in the background.
+        // An unreachable database must not block the counter — fall back to the
+        // local cache, keep queueing writes, and retry in the background.
         setIsHydrating(false);
         setCloudStatus('error');
         setCloudError(err?.message || 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ (จะลองใหม่อัตโนมัติ)');
@@ -225,37 +251,13 @@ export const StoreProvider = ({ children }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Push local changes up (debounced, and never echoing what we just received)
-  const useCloudPush = (key, value) => {
-    useEffect(() => {
-      if (!isCloudEnabled) return;
-      const json = JSON.stringify(value);
-      if (!hydratedRef.current) {
-        // Only edits made after a failed load count as offline work
-        if (connectFailedRef.current && lastSyncedRef.current[key] !== json) {
-          editedWhileDisconnectedRef.current = true;
-        }
-        return;
-      }
-      if (lastSyncedRef.current[key] === json) return;
-
-      const timer = setTimeout(() => {
-        pendingRef.current[key] = value;
-        setPendingCount(Object.keys(pendingRef.current).length);
-        flushPending();
-      }, 400);
-
-      return () => clearTimeout(timer);
-    }, [key, value]);
-  };
-
-  // Retry queued writes: on a timer, and immediately when the network returns
+  // Retry queued writes on a timer and as soon as the network returns
   useEffect(() => {
     if (!isCloudEnabled) return;
     const timer = setInterval(() => {
-      if (Object.keys(pendingRef.current).length > 0) flushPending();
+      if (queueRef.current.size > 0) flushQueue();
     }, 5000);
-    const onOnline = () => flushPending();
+    const onOnline = () => flushQueue();
     window.addEventListener('online', onOnline);
     return () => {
       clearInterval(timer);
@@ -264,7 +266,7 @@ export const StoreProvider = ({ children }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Warn before closing the tab while changes have not reached the database
+  // Warn before closing the tab while writes have not reached the database
   useEffect(() => {
     if (!isCloudEnabled || pendingCount === 0) return;
     const warn = (e) => {
@@ -274,14 +276,6 @@ export const StoreProvider = ({ children }) => {
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [pendingCount]);
-
-  useCloudPush('products', products);
-  useCloudPush('orders', orders);
-  useCloudPush('settings', settings);
-  useCloudPush('employees', employees);
-  useCloudPush('cash_transactions', cashTransactions);
-  useCloudPush('categories', categories);
-  useCloudPush('sizes', sizes);
 
   // Sync to LocalStorage (kept as an offline cache even when the cloud is on)
   useEffect(() => {
@@ -335,7 +329,9 @@ export const StoreProvider = ({ children }) => {
     if (categories.some((c) => c.toLowerCase() === clean.toLowerCase())) {
       return { success: false, error: 'มีหมวดหมู่นี้อยู่แล้ว' };
     }
-    setCategories((prev) => [...prev, clean]);
+    const next = [...categories, clean];
+    setCategories(next);
+    saveList('categories', next);
     return { success: true, value: clean };
   };
 
@@ -344,7 +340,9 @@ export const StoreProvider = ({ children }) => {
     if (products.some((p) => p.category === name)) {
       return { success: false, error: 'ยังมีสินค้าอยู่ในหมวดหมู่นี้' };
     }
-    setCategories((prev) => prev.filter((c) => c !== name));
+    const next = categories.filter((c) => c !== name);
+    setCategories(next);
+    saveList('categories', next);
     return { success: true };
   };
 
@@ -354,7 +352,9 @@ export const StoreProvider = ({ children }) => {
     if (sizes.some((s) => s.toUpperCase() === clean)) {
       return { success: false, error: 'มีไซส์นี้อยู่แล้ว' };
     }
-    setSizes((prev) => [...prev, clean]);
+    const next = [...sizes, clean];
+    setSizes(next);
+    saveList('sizes', next);
     return { success: true, value: clean };
   };
 
@@ -362,7 +362,9 @@ export const StoreProvider = ({ children }) => {
     if (products.some((p) => (p.sizes || []).includes(name))) {
       return { success: false, error: 'ยังมีสินค้าที่ใช้ไซส์นี้อยู่' };
     }
-    setSizes((prev) => prev.filter((s) => s !== name));
+    const next = sizes.filter((s) => s !== name);
+    setSizes(next);
+    saveList('sizes', next);
     return { success: true };
   };
 
@@ -393,31 +395,33 @@ export const StoreProvider = ({ children }) => {
       sku: newProd.sku || generateSku(),
     };
     setProducts((prev) => [productWithId, ...prev]);
+    saveRow('products', productWithId);
     return productWithId;
   };
 
   const updateProduct = (id, updatedFields) => {
-    setProducts((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, ...updatedFields } : p))
-    );
+    const updated = products.map((p) => (p.id === id ? { ...p, ...updatedFields } : p));
+    setProducts(updated);
+    const row = updated.find((p) => p.id === id);
+    if (row) saveRow('products', row);
   };
 
   const deleteProduct = (id) => {
     setProducts((prev) => prev.filter((p) => p.id !== id));
+    deleteRow('products', id);
   };
 
   const updateStockVariant = (productId, size, colorName, newQty) => {
-    setProducts((prev) =>
-      prev.map((p) => {
+    setProducts((prev) => {
+      const next = prev.map((p) => {
         if (p.id !== productId) return p;
         const key = `${size}-${colorName}`;
-        const updatedMatrix = { ...p.stockMatrix, [key]: Math.max(0, newQty) };
-        return {
-          ...p,
-          stockMatrix: updatedMatrix,
-        };
-      })
-    );
+        return { ...p, stockMatrix: { ...p.stockMatrix, [key]: Math.max(0, newQty) } };
+      });
+      const changed = next.find((p) => p.id === productId);
+      if (changed) saveRow('products', changed);
+      return next;
+    });
   };
 
   // Cash Ledger Actions
@@ -440,17 +444,22 @@ export const StoreProvider = ({ children }) => {
     };
 
     setCashTransactions((prev) => [newTx, ...prev]);
+    saveRow('cashTransactions', newTx);
     return newTx;
   };
 
   const updateCashTransaction = (id, fields) => {
-    setCashTransactions((prev) =>
-      prev.map((tx) => (tx.id === id ? { ...tx, ...fields, amount: parseFloat(fields.amount ?? tx.amount) } : tx))
+    const next = cashTransactions.map((tx) =>
+      tx.id === id ? { ...tx, ...fields, amount: parseFloat(fields.amount ?? tx.amount) } : tx
     );
+    setCashTransactions(next);
+    const row = next.find((tx) => tx.id === id);
+    if (row) saveRow('cashTransactions', row);
   };
 
   const deleteCashTransaction = (id) => {
     setCashTransactions((prev) => prev.filter((tx) => tx.id !== id));
+    deleteRow('cashTransactions', id);
   };
 
   // Order Actions & Stock Deduction
@@ -485,7 +494,9 @@ export const StoreProvider = ({ children }) => {
         });
 
         if (modified) {
-          return { ...product, stockMatrix: updatedMatrix };
+          const updatedProduct = { ...product, stockMatrix: updatedMatrix };
+          saveRow('products', updatedProduct);
+          return updatedProduct;
         }
         return product;
       })
@@ -493,6 +504,7 @@ export const StoreProvider = ({ children }) => {
 
     // Record Order
     setOrders((prev) => [newOrder, ...prev]);
+    saveRow('orders', newOrder);
 
     // Automatically record Income Cash Transaction
     const autoIncomeTx = {
@@ -508,6 +520,7 @@ export const StoreProvider = ({ children }) => {
       isAuto: true,
     };
     setCashTransactions((prev) => [autoIncomeTx, ...prev]);
+    saveRow('cashTransactions', autoIncomeTx);
 
     return newOrder;
   };
@@ -532,16 +545,17 @@ export const StoreProvider = ({ children }) => {
         });
 
         if (modified) {
-          return { ...product, stockMatrix: updatedMatrix };
+          const restored = { ...product, stockMatrix: updatedMatrix };
+          saveRow('products', restored);
+          return restored;
         }
         return product;
       })
     );
 
     // Mark as refunded
-    setOrders((prev) =>
-      prev.map((o) => (o.id === orderId ? { ...o, status: 'Refunded' } : o))
-    );
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status: 'Refunded' } : o)));
+    saveRow('orders', { ...targetOrder, status: 'Refunded' });
 
     // Automatically record Expense Cash Transaction for refund
     const now = new Date();
@@ -561,24 +575,35 @@ export const StoreProvider = ({ children }) => {
       isAuto: true,
     };
     setCashTransactions((prev) => [autoRefundTx, ...prev]);
+    saveRow('cashTransactions', autoRefundTx);
   };
 
   // Delete an order from history along with the cash entries it generated.
   // Stock is not restored — use refundOrder for goods that actually came back.
   const deleteOrder = (orderId) => {
     setOrders((prev) => prev.filter((o) => o.id !== orderId));
+    deleteRow('orders', orderId);
+    cashTransactions
+      .filter((tx) => tx.isAuto && tx.referenceId === orderId)
+      .forEach((tx) => deleteRow('cashTransactions', tx.id));
     setCashTransactions((prev) => prev.filter((tx) => !(tx.isAuto && tx.referenceId === orderId)));
   };
 
   const clearOrderHistory = () => {
     const orderIds = new Set(orders.map((o) => o.id));
+    orders.forEach((o) => deleteRow('orders', o.id));
+    cashTransactions
+      .filter((tx) => tx.isAuto && orderIds.has(tx.referenceId))
+      .forEach((tx) => deleteRow('cashTransactions', tx.id));
     setOrders([]);
     setCashTransactions((prev) => prev.filter((tx) => !(tx.isAuto && orderIds.has(tx.referenceId))));
   };
 
   // Settings Action
   const updateSettings = (newSettings) => {
-    setSettings((prev) => ({ ...prev, ...newSettings }));
+    const merged = { ...settings, ...newSettings };
+    setSettings(merged);
+    saveSettings(merged);
   };
 
   // ==========================================
@@ -596,15 +621,20 @@ export const StoreProvider = ({ children }) => {
       totalAdvance: 0,
     };
     setEmployees((prev) => [newEmp, ...prev]);
+    saveRow('employees', newEmp);
     return newEmp;
   };
 
   const updateEmployee = (id, fields) => {
-    setEmployees((prev) => prev.map((e) => (e.id === id ? { ...e, ...fields } : e)));
+    const next = employees.map((e) => (e.id === id ? { ...e, ...fields } : e));
+    setEmployees(next);
+    const row = next.find((e) => e.id === id);
+    if (row) saveRow('employees', row);
   };
 
   const deleteEmployee = (id) => {
     setEmployees((prev) => prev.filter((e) => e.id !== id));
+    deleteRow('employees', id);
   };
 
   // Add a wage log entry (type: 'work' = บวกวัน, 'deduct' = หักวัน, 'advance' = เบิก)
@@ -623,7 +653,9 @@ export const StoreProvider = ({ children }) => {
         const totalAdvance = updatedLogs
           .filter((l) => l.type === 'advance')
           .reduce((acc, l) => acc + l.amount, 0);
-        return { ...e, wageLogs: updatedLogs, totalAdvance };
+        const updatedEmp = { ...e, wageLogs: updatedLogs, totalAdvance };
+        saveRow('employees', updatedEmp);
+        return updatedEmp;
       })
     );
 
@@ -645,6 +677,7 @@ export const StoreProvider = ({ children }) => {
         isAuto: true,
       };
       setCashTransactions((prev) => [advanceTx, ...prev]);
+      saveRow('cashTransactions', advanceTx);
     }
   };
 
@@ -656,7 +689,9 @@ export const StoreProvider = ({ children }) => {
         const totalAdvance = updatedLogs
           .filter((l) => l.type === 'advance')
           .reduce((acc, l) => acc + l.amount, 0);
-        return { ...e, wageLogs: updatedLogs, totalAdvance };
+        const updatedEmp = { ...e, wageLogs: updatedLogs, totalAdvance };
+        saveRow('employees', updatedEmp);
+        return updatedEmp;
       })
     );
   };
@@ -694,8 +729,9 @@ export const StoreProvider = ({ children }) => {
           amount: parseFloat(daysCount) || 1,
           note: note,
         };
-        const updatedLogs = [newLog, ...(e.wageLogs || [])];
-        return { ...e, wageLogs: updatedLogs };
+        const updatedEmp = { ...e, wageLogs: [newLog, ...(e.wageLogs || [])] };
+        saveRow('employees', updatedEmp);
+        return updatedEmp;
       })
     );
   };
@@ -711,6 +747,19 @@ export const StoreProvider = ({ children }) => {
     setCategories(CLOTHING_CATEGORIES);
     setSizes(AVAILABLE_SIZES);
     localStorage.clear();
+
+    // Replace the database contents too, otherwise the next load brings it back
+    products.forEach((p) => deleteRow('products', p.id));
+    orders.forEach((o) => deleteRow('orders', o.id));
+    cashTransactions.forEach((t) => deleteRow('cashTransactions', t.id));
+    employees.forEach((e) => deleteRow('employees', e.id));
+    saveRows('products', INITIAL_PRODUCTS);
+    saveRows('orders', INITIAL_ORDERS);
+    saveRows('cashTransactions', INITIAL_CASH_TRANSACTIONS);
+    saveRows('employees', INITIAL_EMPLOYEES);
+    saveList('categories', CLOTHING_CATEGORIES);
+    saveList('sizes', AVAILABLE_SIZES);
+    saveSettings(INITIAL_STORE_SETTINGS);
   };
 
   // Export / Import Backup Data
@@ -744,6 +793,15 @@ export const StoreProvider = ({ children }) => {
       if (parsed.cashTransactions) setCashTransactions(parsed.cashTransactions);
       if (parsed.categories) setCategories(parsed.categories);
       if (parsed.sizes) setSizes(parsed.sizes);
+
+      // Send the imported data to the database as well
+      if (parsed.products) saveRows('products', parsed.products);
+      if (parsed.orders) saveRows('orders', parsed.orders);
+      if (parsed.cashTransactions) saveRows('cashTransactions', parsed.cashTransactions);
+      if (parsed.employees) saveRows('employees', parsed.employees);
+      if (parsed.categories) saveList('categories', parsed.categories);
+      if (parsed.sizes) saveList('sizes', parsed.sizes);
+      if (parsed.settings) saveSettings(parsed.settings);
       return { success: true };
     } catch (e) {
       return { success: false, error: e.message };
