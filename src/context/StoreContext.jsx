@@ -54,8 +54,9 @@ export const StoreProvider = ({ children }) => {
     return local ? JSON.parse(local) : AVAILABLE_SIZES;
   });
 
-  // Active role: 'owner' (full access) or 'staff' (front-counter only)
-  const [role, setRole] = useState(() => localStorage.getItem('chic_store_role') || 'owner');
+  // Active role: 'owner' (full access) or 'staff' (front-counter only).
+  // A fresh device opens in staff mode — the owner unlocks with the PIN.
+  const [role, setRole] = useState(() => localStorage.getItem('chic_store_role') || 'staff');
   const isStaff = role === 'staff';
 
   // Sync to LocalStorage
