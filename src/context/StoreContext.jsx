@@ -1,4 +1,12 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import {
+  supabase,
+  isCloudEnabled,
+  fetchAllState,
+  pushState,
+  STATE_TABLE,
+  CLIENT_ID,
+} from '../lib/supabase';
 import {
   INITIAL_PRODUCTS,
   INITIAL_ORDERS,
@@ -59,7 +67,133 @@ export const StoreProvider = ({ children }) => {
   const [role, setRole] = useState(() => localStorage.getItem('chic_store_role') || 'staff');
   const isStaff = role === 'staff';
 
-  // Sync to LocalStorage
+  // ==========================================
+  // Cloud sync (Supabase) — shared data across devices.
+  // Without credentials everything below is skipped and the app stays local-only.
+  // ==========================================
+
+  // 'offline' = no database configured, 'connecting' | 'synced' | 'error'
+  const [cloudStatus, setCloudStatus] = useState(isCloudEnabled ? 'connecting' : 'offline');
+  const [cloudError, setCloudError] = useState('');
+
+  const hydratedRef = useRef(false);
+  // Last value seen from / sent to the database per key, so echoes are not pushed back
+  const lastSyncedRef = useRef({});
+
+  const setterFor = {
+    products: setProducts,
+    orders: setOrders,
+    settings: setSettings,
+    employees: setEmployees,
+    cash_transactions: setCashTransactions,
+    categories: setCategories,
+    sizes: setSizes,
+  };
+
+  const applyRemote = (key, value) => {
+    const setter = setterFor[key];
+    if (!setter || value === undefined || value === null) return;
+    lastSyncedRef.current[key] = JSON.stringify(value);
+    setter(value);
+  };
+
+  // Initial load + realtime subscription
+  useEffect(() => {
+    if (!isCloudEnabled) return;
+    let channel;
+    let cancelled = false;
+
+    const localSnapshot = {
+      products,
+      orders,
+      settings,
+      employees,
+      cash_transactions: cashTransactions,
+      categories,
+      sizes,
+    };
+
+    (async () => {
+      try {
+        const remote = await fetchAllState();
+        if (cancelled) return;
+
+        for (const key of Object.keys(setterFor)) {
+          if (remote[key] !== undefined) {
+            applyRemote(key, remote[key]);
+          } else {
+            // First run: seed the database from whatever this device already has
+            await pushState(key, localSnapshot[key]);
+            lastSyncedRef.current[key] = JSON.stringify(localSnapshot[key]);
+          }
+        }
+
+        hydratedRef.current = true;
+        setCloudStatus('synced');
+        setCloudError('');
+
+        channel = supabase
+          .channel('store_state_changes')
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: STATE_TABLE },
+            (payload) => {
+              const row = payload.new;
+              if (!row || row.client_id === CLIENT_ID) return;
+              applyRemote(row.key, row.data);
+            }
+          )
+          .subscribe();
+      } catch (err) {
+        if (cancelled) return;
+        setCloudStatus('error');
+        setCloudError(err?.message || 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+    // Runs once — the local snapshot is only used to seed an empty database
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Push local changes up (debounced, and never echoing what we just received)
+  const useCloudPush = (key, value) => {
+    useEffect(() => {
+      if (!isCloudEnabled || !hydratedRef.current) return;
+      const json = JSON.stringify(value);
+      if (lastSyncedRef.current[key] === json) return;
+
+      const timer = setTimeout(() => {
+        lastSyncedRef.current[key] = json;
+        pushState(key, value)
+          .then(() => {
+            setCloudStatus('synced');
+            setCloudError('');
+          })
+          .catch((err) => {
+            // Allow a retry on the next change
+            delete lastSyncedRef.current[key];
+            setCloudStatus('error');
+            setCloudError(err?.message || 'บันทึกขึ้นฐานข้อมูลไม่สำเร็จ');
+          });
+      }, 400);
+
+      return () => clearTimeout(timer);
+    }, [key, value]);
+  };
+
+  useCloudPush('products', products);
+  useCloudPush('orders', orders);
+  useCloudPush('settings', settings);
+  useCloudPush('employees', employees);
+  useCloudPush('cash_transactions', cashTransactions);
+  useCloudPush('categories', categories);
+  useCloudPush('sizes', sizes);
+
+  // Sync to LocalStorage (kept as an offline cache even when the cloud is on)
   useEffect(() => {
     localStorage.setItem('chic_store_products', JSON.stringify(products));
   }, [products]);
@@ -537,6 +671,9 @@ export const StoreProvider = ({ children }) => {
         CASH_CATEGORIES,
         categories,
         sizes,
+        cloudStatus,
+        cloudError,
+        isCloudEnabled,
         role,
         isStaff,
         enterStaffMode,

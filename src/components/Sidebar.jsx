@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShoppingBag, Package, BarChart3, Receipt, Settings, Shirt, Users, Wallet, Tag, UserCog, Lock } from 'lucide-react';
+import { ShoppingBag, Package, BarChart3, Receipt, Settings, Shirt, Users, Wallet, Tag, UserCog, Lock, Cloud, CloudOff, RefreshCw, AlertTriangle } from 'lucide-react';
 import { useStore } from '../context/StoreContext';
 import { StaffPinModal } from './StaffPinModal';
 
@@ -7,7 +7,7 @@ import { StaffPinModal } from './StaffPinModal';
 export const STAFF_TABS = ['pos', 'orders', 'inventory'];
 
 export const Sidebar = ({ activeTab, setActiveTab, isOpen, onClose }) => {
-  const { settings, isStaff, enterStaffMode } = useStore();
+  const { settings, isStaff, enterStaffMode, cloudStatus } = useStore();
   const [isPinOpen, setIsPinOpen] = useState(false);
 
   const navItems = [
@@ -80,10 +80,34 @@ export const Sidebar = ({ activeTab, setActiveTab, isOpen, onClose }) => {
           {isStaff ? 'ออกจากโหมดพนักงาน' : 'สลับเป็นโหมดพนักงาน'}
         </button>
 
-        {/* Offline Status Badge */}
-        <div className="offline-badge">
-          <div className="offline-dot" />
-          <span>{isStaff ? 'โหมดพนักงานหน้าร้าน' : 'ระบบพร้อมใช้งาน 100% Offline'}</span>
+        {/* Data storage status */}
+        <div
+          className="offline-badge"
+          style={
+            cloudStatus === 'error'
+              ? { background: 'rgba(244,63,94,0.15)', borderColor: 'rgba(244,63,94,0.4)', color: '#fca5a5' }
+              : undefined
+          }
+          title={
+            cloudStatus === 'synced'
+              ? 'ข้อมูลถูกบันทึกบนฐานข้อมูลกลาง ใช้ร่วมกันได้ทุกเครื่อง'
+              : cloudStatus === 'offline'
+                ? 'ยังไม่ได้ตั้งค่าฐานข้อมูล ข้อมูลเก็บอยู่ในเครื่องนี้เท่านั้น'
+                : cloudStatus === 'error'
+                  ? 'เชื่อมฐานข้อมูลไม่สำเร็จ ข้อมูลถูกเก็บไว้ในเครื่องนี้ก่อน'
+                  : 'กำลังเชื่อมต่อฐานข้อมูล...'
+          }
+        >
+          {cloudStatus === 'synced' && <Cloud size={14} />}
+          {cloudStatus === 'offline' && <CloudOff size={14} />}
+          {cloudStatus === 'connecting' && <RefreshCw size={14} />}
+          {cloudStatus === 'error' && <AlertTriangle size={14} />}
+          <span>
+            {cloudStatus === 'synced' && 'ข้อมูลซิงก์กับฐานข้อมูลแล้ว'}
+            {cloudStatus === 'offline' && 'เก็บข้อมูลในเครื่องนี้ (Offline)'}
+            {cloudStatus === 'connecting' && 'กำลังเชื่อมฐานข้อมูล...'}
+            {cloudStatus === 'error' && 'เชื่อมฐานข้อมูลไม่ได้'}
+          </span>
         </div>
       </div>
       </aside>
