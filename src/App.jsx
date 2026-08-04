@@ -9,11 +9,11 @@ import { DashboardView } from './components/dashboard/DashboardView';
 import { OrdersView } from './components/orders/OrdersView';
 import { SettingsView } from './components/settings/SettingsView';
 import { PayrollView } from './components/payroll/PayrollView';
-import { Clock, Menu, UserCog } from 'lucide-react';
+import { Clock, Menu, UserCog, Shirt } from 'lucide-react';
 import { useStore } from './context/StoreContext';
 
 function AppContent() {
-  const { isStaff } = useStore();
+  const { isStaff, isHydrating } = useStore();
   const [activeTab, setActiveTab] = useState('pos');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
@@ -49,6 +49,27 @@ function AppContent() {
     }
   };
 
+
+  // Wait for the database on startup rather than showing this browser's cache
+  if (isHydrating) {
+    return (
+      <div
+        style={{
+          height: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '0.75rem',
+          color: '#94a3b8',
+        }}
+      >
+        <Shirt size={40} color="#8b5cf6" />
+        <div style={{ fontWeight: 700, color: '#fff' }}>กำลังโหลดข้อมูลจากฐานข้อมูล...</div>
+        <div style={{ fontSize: '0.85rem' }}>ดึงข้อมูลสินค้า สต็อก และยอดขายล่าสุดของร้าน</div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-container">

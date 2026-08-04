@@ -74,6 +74,9 @@ export const StoreProvider = ({ children }) => {
 
   // 'offline' = no database configured, 'connecting' | 'synced' | 'error'
   const [cloudStatus, setCloudStatus] = useState(isCloudEnabled ? 'connecting' : 'offline');
+  // True until the first successful load — the app shows a loader instead of
+  // local cache, so nobody sells against stale numbers after a deploy.
+  const [isHydrating, setIsHydrating] = useState(isCloudEnabled);
   const [cloudError, setCloudError] = useState('');
 
   const hydratedRef = useRef(false);
@@ -145,9 +148,12 @@ export const StoreProvider = ({ children }) => {
     sizes,
   };
 
-  // Work done on this device before the database could be reached must not be
-  // thrown away when the connection finally succeeds.
+  // Work done on this device while the database was unreachable must not be
+  // thrown away when the connection finally succeeds. Only set once a load has
+  // actually failed — otherwise the database always wins on startup, so a fresh
+  // device (or a new deploy) can never push sample data over real data.
   const editedWhileDisconnectedRef = useRef(false);
+  const connectFailedRef = useRef(false);
 
   // Initial load (with retry) + realtime subscription
   useEffect(() => {
@@ -176,6 +182,7 @@ export const StoreProvider = ({ children }) => {
         }
 
         hydratedRef.current = true;
+        setIsHydrating(false);
         setPendingCount(Object.keys(pendingRef.current).length);
         setCloudStatus('synced');
         setCloudError('');
@@ -195,6 +202,10 @@ export const StoreProvider = ({ children }) => {
           .subscribe();
       } catch (err) {
         if (cancelled) return;
+        connectFailedRef.current = true;
+        // Unreachable database must not block the counter — fall back to the
+        // local cache and keep retrying in the background.
+        setIsHydrating(false);
         setCloudStatus('error');
         setCloudError(err?.message || 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ (จะลองใหม่อัตโนมัติ)');
         retryTimer = setTimeout(connect, 5000);
@@ -220,8 +231,10 @@ export const StoreProvider = ({ children }) => {
       if (!isCloudEnabled) return;
       const json = JSON.stringify(value);
       if (!hydratedRef.current) {
-        // Changed before the first successful load — local wins when we connect
-        if (lastSyncedRef.current[key] !== json) editedWhileDisconnectedRef.current = true;
+        // Only edits made after a failed load count as offline work
+        if (connectFailedRef.current && lastSyncedRef.current[key] !== json) {
+          editedWhileDisconnectedRef.current = true;
+        }
         return;
       }
       if (lastSyncedRef.current[key] === json) return;
@@ -751,6 +764,7 @@ export const StoreProvider = ({ children }) => {
         cloudStatus,
         cloudError,
         pendingCount,
+        isHydrating,
         isCloudEnabled,
         role,
         isStaff,
